@@ -768,7 +768,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
-		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+		if err := checkIntegrity(ctx, opt.Connector, opt.OutputPath, opt.IntegrityCheck); err != nil {
 			if ctx.Err() == nil {
 				_ = os.Remove(opt.OutputPath)
 				_ = os.Remove(opt.OutputPath + "-shm")
@@ -971,7 +971,9 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 			return fmt.Errorf("decode page: %w", err)
 		}
 
-		if phdr.Pgno == 1 && len(data) >= 28 {
+		// Encrypted databases (e.g. SQLCipher) replace the magic string with
+		// a salt and encrypt the rest of the header, so it cannot be patched.
+		if phdr.Pgno == 1 && len(data) >= 28 && strings.HasPrefix(string(data), "SQLite format 3\x00") {
 			data[18], data[19] = 0x01, 0x01
 			_, _ = rand.Read(data[24:28])
 		}
@@ -1161,7 +1163,7 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
-		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+		if err := checkIntegrity(ctx, opt.Connector, opt.OutputPath, opt.IntegrityCheck); err != nil {
 			if ctx.Err() == nil {
 				_ = os.Remove(opt.OutputPath)
 				_ = os.Remove(opt.OutputPath + "-shm")
@@ -1329,12 +1331,12 @@ func checkpointV3(dbPath string) error {
 }
 
 // checkIntegrity runs a SQLite integrity check on the database at dbPath.
-func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode) error {
+func checkIntegrity(ctx context.Context, connector ConnectorFunc, dbPath string, mode IntegrityCheckMode) error {
 	if mode == IntegrityCheckNone {
 		return nil
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openSQLDB(connector, dbPath)
 	if err != nil {
 		return fmt.Errorf("open database for integrity check: %w", err)
 	}

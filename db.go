@@ -23,7 +23,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/semaphore"
-	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -154,6 +153,11 @@ type DB struct {
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
+
+	// Connector, if set, opens Litestream's connections to the database
+	// instead of the built-in modernc.org/sqlite driver. Litestream applies
+	// busy_timeout and wal_autocheckpoint to each connection itself.
+	Connector ConnectorFunc
 
 	// Minimum time to retain L0 files after they have been compacted into L1.
 	L0Retention time.Duration
@@ -753,6 +757,7 @@ func (db *DB) EnsureExists(ctx context.Context) error {
 	opt := NewRestoreOptions()
 	opt.OutputPath = db.Path()
 	opt.IntegrityCheck = IntegrityCheckQuick
+	opt.Connector = db.Connector
 
 	if err := db.Replica.Restore(ctx, opt); err != nil {
 		if errors.Is(err, ErrTxNotAvailable) || errors.Is(err, ErrNoSnapshots) {
@@ -1005,19 +1010,7 @@ func (db *DB) setPersistWAL(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	return conn.Raw(func(driverConn interface{}) error {
-		fc, ok := driverConn.(sqlite.FileControl)
-		if !ok {
-			return fmt.Errorf("driver does not implement FileControl")
-		}
-
-		_, err := fc.FileControlPersistWAL("main", 1)
-		if err != nil {
-			return fmt.Errorf("FileControlPersistWAL: %w", err)
-		}
-
-		return nil
-	})
+	return conn.Raw(setPersistWALConn)
 }
 
 // init initializes the connection to the database.
@@ -1043,10 +1036,16 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
-		db.path, db.BusyTimeout.Milliseconds())
-
-	if db.db, err = sql.Open("sqlite", dsn); err != nil {
+	if db.Connector != nil {
+		db.db, err = openSQLDB(db.Connector, db.path,
+			fmt.Sprintf("PRAGMA busy_timeout = %d", db.BusyTimeout.Milliseconds()),
+			"PRAGMA wal_autocheckpoint = 0")
+	} else {
+		dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
+			db.path, db.BusyTimeout.Milliseconds())
+		db.db, err = sql.Open("sqlite", dsn)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -3342,6 +3341,11 @@ type RestoreOptions struct {
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode
+
+	// Connector, if set, opens the restored database for the integrity check
+	// instead of the built-in modernc.org/sqlite driver. Required when the
+	// database is encrypted (e.g. SQLCipher).
+	Connector ConnectorFunc
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
