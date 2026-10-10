@@ -396,3 +396,27 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		}
 	})
 }
+
+// The monitor opens its connection on its first tick, so a Close inside the
+// first MonitorInterval used to skip the final sync and replicate nothing.
+func TestDB_Close_SyncsBeforeFirstMonitorTick(t *testing.T) {
+	db := testingutil.MustOpenDB(t)
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	if _, err := sqldb.Exec(`CREATE TABLE t (x); INSERT INTO t VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+
+	itr, err := db.Replica.Client.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+	if !itr.Next() {
+		t.Fatal("Close replicated nothing")
+	}
+}

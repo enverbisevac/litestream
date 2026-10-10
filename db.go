@@ -834,6 +834,19 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	}
 	defer db.execSem.Release(1)
 
+	// The monitor only initializes on its first tick, so a Close inside the
+	// first MonitorInterval would otherwise skip the final sync and ship
+	// nothing written since Open. A file that cannot be initialized keeps the
+	// old behavior — skipped, not an error — since the monitor has been
+	// failing on it all along and one such file must not fail Store.Close.
+	db.mu.Lock()
+	if db.opened && db.db == nil {
+		if e := db.init(ctx); e != nil {
+			db.Logger.Warn("final sync skipped: database not initialized", "error", e)
+		}
+	}
+	db.mu.Unlock()
+
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
 		if _, e := db.syncLocked(ctx, 0); e != nil {
