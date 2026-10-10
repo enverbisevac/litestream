@@ -4681,3 +4681,54 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	default:
 	}
 }
+
+// unreachableReplicaClient fails every listing, as a replica does offline.
+type unreachableReplicaClient struct {
+	*testReplicaClient
+}
+
+func (c *unreachableReplicaClient) LTXFiles(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+	return nil, errors.New("replica unreachable")
+}
+
+// Closing any descriptor to a file drops every POSIX lock the process holds on
+// it. Embedded in the application that writes the database, a descriptor
+// closed on each failed init (every tick while the replica is unreachable)
+// dropped the application's own SQLite locks, so another client closing the
+// database cleanly would unlink the WAL under it.
+func TestDB_FailedInitKeepsTheDatabaseDescriptor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	sqldb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE t (x);`); err != nil {
+		t.Fatal(err)
+	}
+
+	db := NewDB(path)
+	db.MonitorInterval = 0
+	db.Replica = NewReplicaWithClient(db, &unreachableReplicaClient{&testReplicaClient{dir: t.TempDir()}})
+
+	if err := db.Sync(t.Context()); err == nil {
+		t.Fatal("sync succeeded against an unreachable replica")
+	}
+	f := db.f
+	if f == nil {
+		t.Fatal("failed init closed the database descriptor")
+	}
+	if err := db.Sync(t.Context()); err == nil {
+		t.Fatal("sync succeeded against an unreachable replica")
+	}
+	if db.f != f {
+		t.Fatal("failed init reopened the database descriptor instead of keeping it")
+	}
+	if _, err := f.Stat(); err != nil {
+		t.Fatalf("database descriptor was closed: %v", err)
+	}
+	_ = db.Close(t.Context())
+	if db.f != nil {
+		t.Fatal("Close kept the database descriptor")
+	}
+}

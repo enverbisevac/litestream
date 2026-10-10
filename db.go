@@ -1026,6 +1026,27 @@ func (db *DB) setPersistWAL(ctx context.Context) error {
 	return conn.Raw(setPersistWALConn)
 }
 
+// openFile opens db.f unless it is already open on the file at db.path.
+func (db *DB) openFile() error {
+	if db.f != nil {
+		held, err := db.f.Stat()
+		if err != nil {
+			return fmt.Errorf("stat db file descriptor: %w", err)
+		}
+		if os.SameFile(held, db.fileInfo) {
+			return nil
+		}
+		_ = db.f.Close()
+		db.f = nil
+	}
+	f, err := os.Open(db.path)
+	if err != nil {
+		return fmt.Errorf("open db file descriptor: %w", err)
+	}
+	db.f = f
+	return nil
+}
+
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) init(ctx context.Context) (err error) {
@@ -1067,9 +1088,14 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return fmt.Errorf("set PERSIST_WAL: %w", err)
 	}
 
-	// Open long-running database file descriptor. Required for non-OFD locks.
-	if db.f, err = os.Open(db.path); err != nil {
-		return fmt.Errorf("open db file descriptor: %w", err)
+	// Open the long-running database file descriptor, required for non-OFD
+	// locks, and keep it across failed inits. Closing any descriptor to a file
+	// drops every POSIX lock the process holds on it, so when Litestream runs
+	// inside the application that writes the database, closing it on each
+	// failed init (every tick while the replica is unreachable) would drop the
+	// application's own SQLite locks. Reopened only if the file was replaced.
+	if err := db.openFile(); err != nil {
+		return err
 	}
 
 	// Ensure database is closed if init fails.
@@ -1078,8 +1104,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 		if err != nil {
 			_ = db.releaseReadLock()
 			db.db.Close()
-			db.f.Close()
-			db.db, db.f = nil, nil
+			db.db = nil
 		}
 	}()
 
