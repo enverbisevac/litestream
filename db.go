@@ -78,6 +78,10 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	// cleanClose is the record the previous Close left, until the first
+	// verify after a start has used it. Guarded by execSem.
+	cleanClose *cleanCloseRecord
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -851,6 +855,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	if db.db != nil {
 		if _, e := db.syncLocked(ctx, 0); e != nil {
 			err = e
+		} else if e := db.recordCleanClose(ctx); e != nil {
+			db.Logger.Warn("clean close not recorded; next start takes a full snapshot", "error", e)
 		}
 	}
 
@@ -1147,6 +1153,8 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return err
 	}
 
+	db.cleanClose = db.takeCleanClose()
+
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
@@ -1421,6 +1429,12 @@ func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool,
 	info, err := db.verifyWithExecutor(ctx, exec)
 	if err != nil {
 		return syncResult{}, fmt.Errorf("cannot verify wal state: %w", err)
+	}
+	if rec := db.cleanClose; rec != nil {
+		db.cleanClose = nil
+		if info.snapshotting && exec.pos.TXID != 0 {
+			info, _ = db.resumeAfterCleanClose(ctx, rec, exec, info)
+		}
 	}
 
 	db.setSyncDiagPhase(diagPhaseSyncLTX, func(s *diagState) {
