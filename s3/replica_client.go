@@ -488,6 +488,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		})
 	}
 
+	// The uploader would abort a failed upload on the request's context, which
+	// is already cancelled when shutdown is what failed it; the parts then stay
+	// in the bucket, billed and unlisted. multipartUpload aborts instead.
+	uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
+		u.LeavePartsOnError = true
+	})
 	if c.PartSize > 0 {
 		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
 			u.PartSize = c.PartSize
@@ -808,7 +814,7 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 
 	// At or above the part size the uploader splits the seekable body into
 	// section readers without copying it into part buffers.
-	out, err := c.uploader.Upload(ctx, input)
+	out, err := c.multipartUpload(ctx, input)
 	if err != nil {
 		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
 	}
@@ -846,11 +852,37 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 	// Combine buffered prefix with rest of reader so nothing is re-read.
 	rc := internal.NewReadCounter(io.MultiReader(bytes.NewReader(buf.Bytes()), r))
 	input.Body = rc
-	out, err := c.uploader.Upload(ctx, input)
+	out, err := c.multipartUpload(ctx, input)
 	if err != nil {
 		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
 	}
 	return rc.N(), timestamp, out.ETag, nil
+}
+
+// abortUploadTimeout bounds the abort after a failed multipart upload. It runs
+// past the caller's cancellation, so it must not hold up a shutdown for long.
+const abortUploadTimeout = 3 * time.Second
+
+// multipartUpload uploads with the multipart uploader and, when that fails,
+// aborts the upload on a context of its own.
+func (c *ReplicaClient) multipartUpload(ctx context.Context, input *s3.PutObjectInput) (*manager.UploadOutput, error) {
+	out, err := c.uploader.Upload(ctx, input)
+	if err == nil {
+		return out, nil
+	}
+	var failure manager.MultiUploadFailure
+	if errors.As(err, &failure) && failure.UploadID() != "" {
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortUploadTimeout)
+		defer cancel()
+		if _, aerr := c.s3.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{
+			Bucket:   input.Bucket,
+			Key:      input.Key,
+			UploadId: aws.String(failure.UploadID()),
+		}); aerr != nil {
+			c.logger.Warn("abort multipart upload failed", "key", aws.ToString(input.Key), "error", aerr)
+		}
+	}
+	return nil, err
 }
 
 // putObjectInput returns a PutObjectInput populated with the client's write
